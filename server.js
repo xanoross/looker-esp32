@@ -1,6 +1,8 @@
 /**
  * Looker → ESP32 Middleware Server
- * Handles Looker's "CSV zip file" webhook delivery format
+ * Handles Looker's JSON webhook where the zip is base64-encoded
+ * inside attachment.data
+ *
  * Deploy free to: Render.com
  */
 
@@ -10,22 +12,8 @@ const { parse } = require("csv-parse/sync");
 
 const app = express();
 
-// Accept raw binary bodies (the zip file Looker sends)
-app.use(express.raw({ type: "*/*", limit: "50mb" }));
-
-// Also accept JSON for the manual test endpoint
-app.use((req, res, next) => {
-  if (req.headers["content-type"]?.includes("application/json")) {
-    let data = "";
-    req.on("data", chunk => { data += chunk; });
-    req.on("end", () => {
-      try { req.jsonBody = JSON.parse(data); } catch(e) {}
-      next();
-    });
-  } else {
-    next();
-  }
-});
+// Looker sends JSON (with the zip base64-encoded inside it)
+app.use(express.json({ limit: "50mb" }));
 
 // ─── In-memory store ──────────────────────────────────────────────────────────
 let displayData = {
@@ -57,84 +45,113 @@ function checkDisplayToken(req, res, next) {
   next();
 }
 
-// ─── POST /webhook/raw  ← Point Looker here FIRST ────────────────────────────
-// Click "Test now" in Looker, then check your Render logs.
-// You will see the exact filenames and column names inside the zip.
+// ─── Helper: decode the zip from Looker's JSON payload ───────────────────────
+function extractZip(body) {
+  const b64 = body?.attachment?.data;
+  if (!b64) throw new Error("No attachment.data found in payload");
+  const buffer = Buffer.from(b64, "base64");
+  return new AdmZip(buffer);
+}
+
+// ─── Helper: parse a number from a Looker CSV value like "$795,800,211" ───────
+function parseNum(val) {
+  if (val === null || val === undefined || val === "") return null;
+  const n = parseFloat(String(val).replace(/[$,\s]/g, ""));
+  return isNaN(n) ? null : n;
+}
+
+// ─── POST /webhook/raw  ← Step 8: point Looker here first to check columns ───
 app.post("/webhook/raw", (req, res) => {
   try {
-    console.log("[raw] body size (bytes):", req.body?.length);
-    const zip = new AdmZip(req.body);
+    const zip = extractZip(req.body);
     const entries = zip.getEntries();
 
-    console.log("[raw] files inside zip:");
+    console.log("\n[raw] ── FILES IN ZIP ──────────────────────────────");
     entries.forEach(entry => {
-      console.log("  FILE:", entry.entryName);
-      const text = entry.getData().toString("utf8");
-      console.log("  CONTENT (first 500 chars):\n", text.slice(0, 500));
-      console.log("  ---");
+      console.log("\n  FILE:", entry.entryName);
+      try {
+        const text = entry.getData().toString("utf8");
+        console.log("  FIRST 3 ROWS:\n", text.split("\n").slice(0, 3).join("\n"));
+      } catch(e) {
+        console.log("  (could not read as text)");
+      }
+      console.log("  ──────────────────────────────────────────────────");
     });
 
     res.status(200).json({ ok: true, files: entries.map(e => e.entryName) });
   } catch (err) {
-    console.error("[raw] error - maybe not a zip?", err.message);
-    console.log("[raw] raw body:", req.body?.toString?.("utf8")?.slice(0, 1000));
-    res.status(200).json({ ok: true, note: "check logs" });
+    console.error("[raw] error:", err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
 // ─── POST /webhook  ← The real delivery endpoint ─────────────────────────────
-// After checking /webhook/raw logs, update the column name mappings below.
 app.post("/webhook", checkWebhookToken, (req, res) => {
   try {
-    const zip = new AdmZip(req.body);
+    const zip = extractZip(req.body);
     const entries = zip.getEntries();
 
     entries.forEach(entry => {
       const filename = entry.entryName.toLowerCase();
-      const text = entry.getData().toString("utf8");
-      let rows;
+      let text, rows;
+
       try {
+        text = entry.getData().toString("utf8");
         rows = parse(text, { columns: true, skip_empty_lines: true, trim: true });
       } catch(e) {
-        console.error("[webhook] CSV parse error in", entry.entryName, e.message);
+        console.error("[webhook] could not parse", entry.entryName, e.message);
         return;
       }
 
-      console.log(`[webhook] file: ${entry.entryName} | rows: ${rows.length}`);
-      if (rows.length > 0) console.log("[webhook] columns:", Object.keys(rows[0]));
+      if (rows.length === 0) return;
+      const cols = Object.keys(rows[0]);
+      console.log(`[webhook] ${entry.entryName} → ${rows.length} rows, cols:`, cols);
 
-      // ── Update these to match your actual CSV column names ─────────────────
-      // You will find the exact names in your Render logs after the /raw test
-
-      if (filename.includes("omnibus") || filename.includes("balance")) {
-        const val = rows[0]?.[Object.keys(rows[0])[0]];
-        if (val) displayData.omnibus_balance = parseFloat(String(val).replace(/[$,]/g, ""));
+      // ── live_usdc_balances_by_client.csv ─────────────────────────────────
+      if (filename.includes("live_usdc_balances_by_client")) {
+        displayData.top_clients = rows.slice(0, 8).map(row => ({
+          id:      row[cols[0]],             // first column: org ID e.g. "MOEM"
+          balance: parseNum(row[cols[1]])    // second column: balance amount
+        }));
+        // Also grab the omnibus total (sum of all clients)
+        const total = displayData.top_clients.reduce((s, c) => s + (c.balance || 0), 0);
+        if (!displayData.omnibus_balance) displayData.omnibus_balance = total;
       }
 
-      if (filename.includes("client") || filename.includes("org")) {
-        displayData.top_clients = rows.slice(0, 8).map(row => {
-          const keys = Object.keys(row);
-          return {
-            id:      row[keys[0]],
-            balance: parseFloat(String(row[keys[1]] || "0").replace(/[$,]/g, ""))
-          };
-        });
+      // ── usdc_deposits.csv ────────────────────────────────────────────────
+      if (filename.includes("usdc_deposits")) {
+        displayData.recent_deposits = rows.slice(0, 8).map(row => ({
+          ts:     row[cols[0]] || "",        // first column: timestamp
+          org:    row[cols[1]] || "",        // second column: org ID
+          amount: parseNum(row[cols[3]])     // fourth column: amount (cols[2] is likely direction)
+        }));
       }
 
-      if (filename.includes("deposit") || filename.includes("transaction")) {
-        displayData.recent_deposits = rows.slice(0, 8).map(row => {
-          const keys = Object.keys(row);
-          return {
-            ts:     row[keys[0]] || "",
-            org:    row[keys[1]] || "",
-            amount: parseFloat(String(row[keys[3]] || "0").replace(/[$,]/g, ""))
-          };
-        });
+      // ── annual_run_rate_by_client (copy_2) ───────────────────────────────
+      // This tile likely contains gross revenue - grab the total from first row
+      if (filename.includes("annual_run_rate") && filename.includes("copy_2")) {
+        if (rows[0]) {
+          displayData.gross_revenue_annual = parseNum(rows[0][cols[cols.length - 1]]);
+        }
+      }
+
+      // ── annual_run_rate_by_client (copy_3) ───────────────────────────────
+      // This tile likely contains net revenue
+      if (filename.includes("annual_run_rate") && filename.includes("copy_3")) {
+        if (rows[0]) {
+          displayData.net_revenue_annual = parseNum(rows[0][cols[cols.length - 1]]);
+        }
+      }
+
+      // ── new_tile.csv and new_tile_1.csv ──────────────────────────────────
+      // Single-value tiles — log them so we can identify what they contain
+      if (filename.includes("new_tile")) {
+        console.log("[webhook] new_tile contents:", JSON.stringify(rows.slice(0, 3)));
       }
     });
 
     displayData.updated_at = new Date().toISOString();
-    console.log("[webhook] stored at", displayData.updated_at);
+    console.log("[webhook] ✓ stored at", displayData.updated_at);
     res.status(200).json({ ok: true });
 
   } catch (err) {
@@ -154,7 +171,7 @@ app.get("/display", checkDisplayToken, (req, res) => {
     if (abs >= 1e9) return sign + (abs / 1e9).toFixed(2) + "B";
     if (abs >= 1e6) return sign + (abs / 1e6).toFixed(2) + "M";
     if (abs >= 1e3) return sign + (abs / 1e3).toFixed(1) + "K";
-    return String(n);
+    return n.toFixed(0);
   };
 
   res.json({
@@ -177,9 +194,8 @@ app.get("/display", checkDisplayToken, (req, res) => {
 });
 
 // ─── POST /display/manual  ← Test without waiting for Looker ─────────────────
-app.post("/display/manual", (req, res) => {
-  const body = req.jsonBody || {};
-  Object.assign(displayData, body);
+app.post("/display/manual", express.json(), (req, res) => {
+  Object.assign(displayData, req.body);
   displayData.updated_at = new Date().toISOString();
   res.json({ ok: true });
 });
