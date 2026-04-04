@@ -1,0 +1,17 @@
+{
+  "name": "looker-esp32-bridge",
+  "version": "1.0.0",
+  "description": "Webhook bridge between Looker and ESP32 display",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "adm-zip": "^0.5.10",
+    "csv-parse": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
