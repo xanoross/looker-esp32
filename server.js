@@ -125,6 +125,19 @@ app.post("/webhook", checkWebhookToken, (req, res) => {
   }
 });
  
+// ─── London time helper (handles BST/GMT automatically) ───────────────────────
+function toLondonTime(isoStr) {
+  if (!isoStr) return "never";
+  const d = new Date(isoStr);
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/London",
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hour12: false,
+  }).formatToParts(d);
+  const get = type => parts.find(p => p.type === type).value;
+  return `${get("year")}-${get("month")}-${get("day")} ${get("hour")}:${get("minute")}`;
+}
+
 // ─── GET /display  ← ESP32 polls this every hour ─────────────────────────────
 app.get("/display", checkDisplayToken, (req, res) => {
   const fmt = (n) => {
@@ -152,7 +165,7 @@ app.get("/display", checkDisplayToken, (req, res) => {
       org: dep.org,
       amt: fmt(dep.amount),
     })),
-    updated: d.updated_at ? d.updated_at.slice(0, 16).replace("T", " ") : "never",
+    updated: toLondonTime(d.updated_at),
   });
 });
  
