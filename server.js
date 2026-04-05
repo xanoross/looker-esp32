@@ -69,35 +69,27 @@ app.post("/webhook", checkWebhookToken, (req, res) => {
       if (!rows.length) return;
  
       // ── Live omnibus balance ─────────────────────────────────────────────
-      // File: new_tile_1.csv  |  Column: "Total Balance"  |  e.g. 795,170,211
       if (f.includes("new_tile_1")) {
         displayData.omnibus_balance = parseNum(rows[0]["Total Balance"]);
       }
  
       // ── Annual gross revenue (run rate) ──────────────────────────────────
-      // File: new_tile.csv  |  Column: "(1) Treasury Balances Snapshots Total Balance"
-      // First row is the most recent snapshot = current run rate
       if (f.includes("new_tile") && !f.includes("new_tile_1")) {
         const col = "(1) Treasury Balances Snapshots Total Balance";
         displayData.gross_revenue_annual = parseNum(rows[0][col]);
       }
  
       // ── Exit balance at 3.4% ─────────────────────────────────────────────
-      // File: annual_run_rate_by_client_(copy_3).csv  |  Column: "Total at 3.4%"
-      // All rows show the same grand total — just take row 0
       if (f.includes("copy_3")) {
         displayData.exit_balance = parseNum(rows[0]["Total at 3.4%"]);
       }
  
       // ── Annual net revenue (copper rewards) ──────────────────────────────
-      // File: annual_run_rate_by_client_(copy_2).csv  |  Column: "Total Copper Rewards"
       if (f.includes("copy_2")) {
         displayData.net_revenue_annual = parseNum(rows[0]["Total Copper Rewards"]);
       }
  
       // ── Client balances ──────────────────────────────────────────────────
-      // File: live_usdc_balances_by_client.csv
-      // Columns: "Organization ID", "Total Wallet Balance"
       if (f.includes("live_usdc_balances_by_client")) {
         displayData.top_clients = rows
           .filter(r => r["Organization ID"])
@@ -109,9 +101,6 @@ app.post("/webhook", checkWebhookToken, (req, res) => {
       }
  
       // ── Recent deposits ──────────────────────────────────────────────────
-      // File: usdc_deposits.csv
-      // Columns by position: [0]=row num, [1]=timestamp, [2]=org ID,
-      //                       [3]=direction (1/-1), [4]=amount
       if (f.includes("usdc_deposits")) {
         const cols = Object.keys(rows[0]);
         console.log("[webhook] deposit columns:", cols);
@@ -150,15 +139,15 @@ app.get("/display", checkDisplayToken, (req, res) => {
  
   const d = displayData;
   res.json({
-    bal:       fmt(d.omnibus_balance),        // e.g. "795.17M"
-    exit:      fmt(d.exit_balance),           // e.g. "26.64M"
-    rev_gross: fmt(d.gross_revenue_annual),   // e.g. "806.58M"
-    rev_net:   fmt(d.net_revenue_annual),     // e.g. "1.89M"
+    bal:       fmt(d.omnibus_balance),
+    exit:      fmt(d.exit_balance),
+    rev_gross: fmt(d.gross_revenue_annual),
+    rev_net:   fmt(d.net_revenue_annual),
     clients: d.top_clients.slice(0, 6).map(c => ({
       id:  c.id,
       bal: fmt(c.balance),
     })),
-    deposits: d.recent_deposits.slice(0, 5).map(dep => ({
+    deposits: d.recent_deposits.slice(0, 8).map(dep => ({   // ← was 5, now 8
       ts:  dep.ts ? String(dep.ts).slice(5, 16).replace("T", " ") : "",
       org: dep.org,
       amt: fmt(dep.amount),
