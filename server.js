@@ -62,6 +62,13 @@ function parseRows(entry) {
   return parse(text, { columns: true, skip_empty_lines: true, trim: true });
 }
 
+// Only overwrite a stored balance when the new reading is a real positive number.
+// A null / blank / 0 reading is treated as a transient miss, so the previous
+// (last-known-good) value is kept instead of flipping the dashboard to $0.
+function keepPositive(prev, incoming) {
+  return (incoming != null && !isNaN(incoming) && incoming > 0) ? incoming : prev;
+}
+
 // ─── POST /webhook  ← Looker delivers here ───────────────────────────────────
 app.post("/webhook", checkWebhookToken, (req, res) => {
   try {
@@ -73,47 +80,49 @@ app.post("/webhook", checkWebhookToken, (req, res) => {
       try { rows = parseRows(entry); } catch(e) { return; }
       if (!rows.length) return;
 
-      // ── Live omnibus balance ─────────────────────────────────────────────
+      // ── Live omnibus balance (keep last good on a blank/0 read) ──────────
       if (f.includes("new_tile_1")) {
-        displayData.omnibus_balance = parseNum(rows[0]["Total Balance"]);
+        displayData.omnibus_balance = keepPositive(displayData.omnibus_balance, parseNum(rows[0]["Total Balance"]));
       }
 
       // ── Annual gross revenue (run rate) ──────────────────────────────────
       if (f.includes("new_tile") && !f.includes("new_tile_1")) {
         const col = "(1) Treasury Balances Snapshots Total Balance";
-        displayData.gross_revenue_annual = parseNum(rows[0][col]);
+        displayData.gross_revenue_annual = keepPositive(displayData.gross_revenue_annual, parseNum(rows[0][col]));
       }
 
       // ── Exit balance at 3.4% ─────────────────────────────────────────────
       if (f.includes("copy_3")) {
-        displayData.exit_balance = parseNum(rows[0]["Total at 3.4%"]);
+        displayData.exit_balance = keepPositive(displayData.exit_balance, parseNum(rows[0]["Total at 3.4%"]));
       }
 
       // ── Annual net revenue (copper rewards) ──────────────────────────────
       if (f.includes("copy_2")) {
-        displayData.net_revenue_annual = parseNum(rows[0]["Total Copper Rewards"]);
+        displayData.net_revenue_annual = keepPositive(displayData.net_revenue_annual, parseNum(rows[0]["Total Copper Rewards"]));
       }
 
-      // ── Client balances ──────────────────────────────────────────────────
+      // ── Client balances (only replace when this delivery actually has them) ─
       if (f.includes("live_usdc_balances_by_client")) {
-        displayData.top_clients = rows
+        const list = rows
           .filter(r => r["Organization ID"])
           .slice(0, 8)
           .map(r => ({
             id:      r["Organization ID"],
             balance: parseNum(r["Total Wallet Balance"]),
           }));
+        if (list.length) displayData.top_clients = list;
       }
 
-      // ── Recent deposits ──────────────────────────────────────────────────
+      // ── Recent deposits (only replace when this delivery actually has them) ─
       if (f.includes("usdc_deposits")) {
         const cols = Object.keys(rows[0]);
         console.log("[webhook] deposit columns:", cols);
-        displayData.recent_deposits = rows.slice(0, 8).map(r => ({
+        const deps = rows.slice(0, 8).map(r => ({
           ts:     r[cols[1]] || "",
           org:    r[cols[2]] || "",
           amount: parseNum(r[cols[4]]),
         }));
+        if (deps.length) displayData.recent_deposits = deps;
       }
     });
 
@@ -168,6 +177,14 @@ function buildFlowPayload(d) {
   for (let i = 0; i < 6; i++) {
     payload[`client${i + 1}_id`]      = clients[i] ? String(clients[i].id) : "";
     payload[`client${i + 1}_balance`] = clients[i] ? num(clients[i].balance) : 0;
+  }
+  // Recent deposits (top 5). "when" trimmed to "MM-DD HH:MM" like the /display feed.
+  const deps = (d.recent_deposits || []).slice(0, 5);
+  const shortTs = ts => ts ? String(ts).slice(5, 16).replace("T", " ") : "";
+  for (let i = 0; i < 5; i++) {
+    payload[`deposit${i + 1}_when`] = deps[i] ? shortTs(deps[i].ts) : "";
+    payload[`deposit${i + 1}_org`]  = deps[i] ? String(deps[i].org) : "";
+    payload[`deposit${i + 1}_amt`]  = deps[i] ? num(deps[i].amount) : 0;
   }
   return payload;
 }
