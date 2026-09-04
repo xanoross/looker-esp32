@@ -1,5 +1,5 @@
 /**
- * Looker → ESP32 + Slack Middleware Server
+ * Looker → ESP32 + Excel (Power Automate) Middleware Server
  * Final version with confirmed column mappings
  * Deploy free to: Render.com
  */
@@ -39,11 +39,10 @@ function checkDisplayToken(req, res, next) {
   next();
 }
 
-// ─── Slack config ───────────────────────────────────────────────────────────────
-const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN || null;   // xoxb-… (Render env var)
-const SLACK_CHANNEL   = process.env.SLACK_CHANNEL   || null;   // channel ID, e.g. C0123ABCD
-const SLACK_TITLE     = process.env.SLACK_TITLE     || "USDC Balances — Live";
-let   slackMessageTs  = null;                                  // remembered so we edit one message
+// ─── Power Automate flow (Excel-in-SharePoint) ────────────────────────────────
+// Set FLOW_WEBHOOK_URL to the URL your Power Automate flow generates.
+// Leave it blank and this step is skipped silently.
+const FLOW_WEBHOOK_URL = process.env.FLOW_WEBHOOK_URL || null;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function extractZip(body) {
@@ -61,17 +60,6 @@ function parseNum(val) {
 function parseRows(entry) {
   const text = entry.getData().toString("utf8");
   return parse(text, { columns: true, skip_empty_lines: true, trim: true });
-}
-
-// Shared money formatter (used by /display and Slack)
-function fmtMoney(n) {
-  if (n == null || isNaN(n)) return "---";
-  const abs = Math.abs(n);
-  const s = n < 0 ? "-" : "";
-  if (abs >= 1e9) return s + "$" + (abs / 1e9).toFixed(2) + "B";
-  if (abs >= 1e6) return s + "$" + (abs / 1e6).toFixed(2) + "M";
-  if (abs >= 1e3) return s + "$" + (abs / 1e3).toFixed(1) + "K";
-  return s + "$" + Math.abs(n).toFixed(0);
 }
 
 // ─── POST /webhook  ← Looker delivers here ───────────────────────────────────
@@ -135,8 +123,9 @@ app.post("/webhook", checkWebhookToken, (req, res) => {
       "| clients:", displayData.top_clients.length,
       "| deposits:", displayData.recent_deposits.length);
 
-    // Push to Slack — fire-and-forget so it never blocks/breaks the webhook 200.
-    pushToSlack().catch(e => console.error("[slack] push failed:", e.message));
+    // Push to the Excel dashboard via Power Automate — fire-and-forget so it
+    // never blocks or breaks the webhook 200 (and the ESP32 feed).
+    pushToFlow().catch(e => console.error("[flow] push failed:", e.message));
 
     res.status(200).json({ ok: true });
   } catch (err) {
@@ -158,74 +147,41 @@ function toLondonTime(isoStr) {
   return `${get("year")}-${get("month")}-${get("day")} ${get("hour")}:${get("minute")}`;
 }
 
-// ─── Slack: build the message ─────────────────────────────────────────────────
-function buildSlackBlocks(d) {
-  const blocks = [
-    { type: "header", text: { type: "plain_text", text: SLACK_TITLE, emoji: true } },
-    {
-      type: "section",
-      fields: [
-        { type: "mrkdwn", text: `*Omnibus balance*\n${fmtMoney(d.omnibus_balance)}` },
-        { type: "mrkdwn", text: `*Exit balance (3.4%)*\n${fmtMoney(d.exit_balance)}` },
-        { type: "mrkdwn", text: `*Gross revenue (annual)*\n${fmtMoney(d.gross_revenue_annual)}` },
-        { type: "mrkdwn", text: `*Net revenue (annual)*\n${fmtMoney(d.net_revenue_annual)}` },
-      ],
-    },
-  ];
-
-  if (d.top_clients && d.top_clients.length) {
-    const lines = d.top_clients
-      .slice(0, 6)
-      .map((c, i) => `${i + 1}. \`${c.id}\` — ${fmtMoney(c.balance)}`)
-      .join("\n");
-    blocks.push({ type: "divider" });
-    blocks.push({ type: "section", text: { type: "mrkdwn", text: `*Top clients*\n${lines}` } });
+// ─── Build the flat payload the Power Automate flow expects ────────────────────
+// One flat object → maps directly onto one row of the Excel "Data" table.
+// Numbers are sent raw (not formatted) so Excel holds real numbers and formats them.
+function buildFlowPayload(d) {
+  // Power Automate's Parse JSON only exposes single-typed fields as mappable
+  // tokens, so every numeric field is sent as a plain number (missing → 0),
+  // never null. IDs are always strings (missing → "").
+  const num = v => (v == null || isNaN(v)) ? 0 : Number(v);
+  const payload = {
+    id:                   1,                       // fixed key — always the same row
+    omnibus_balance:      num(d.omnibus_balance),
+    exit_balance:         num(d.exit_balance),
+    gross_revenue_annual: num(d.gross_revenue_annual),
+    net_revenue_annual:   num(d.net_revenue_annual),
+    updated_london:       toLondonTime(d.updated_at),
+    updated_iso:          d.updated_at || "",
+  };
+  const clients = (d.top_clients || []).slice(0, 6);
+  for (let i = 0; i < 6; i++) {
+    payload[`client${i + 1}_id`]      = clients[i] ? String(clients[i].id) : "";
+    payload[`client${i + 1}_balance`] = clients[i] ? num(clients[i].balance) : 0;
   }
-
-  blocks.push({
-    type: "context",
-    elements: [{ type: "mrkdwn", text: `Updated ${toLondonTime(d.updated_at)} London · refreshes every 15 min` }],
-  });
-
-  return blocks;
+  return payload;
 }
 
-// ─── Slack: post once, then edit the same message every cycle ─────────────────
-async function slackCall(method, payload) {
-  const r = await fetch(`https://slack.com/api/${method}`, {
+async function pushToFlow() {
+  if (!FLOW_WEBHOOK_URL) return;   // not configured — skip silently
+  const payload = buildFlowPayload(displayData);
+  const r = await fetch(FLOW_WEBHOOK_URL, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json; charset=utf-8",
-      "Authorization": `Bearer ${SLACK_BOT_TOKEN}`,
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-  const json = await r.json();
-  if (!json.ok) throw new Error(`${method}: ${json.error}`);
-  return json;
-}
-
-async function pushToSlack() {
-  if (!SLACK_BOT_TOKEN || !SLACK_CHANNEL) return;   // Slack not configured — skip silently
-
-  const blocks = buildSlackBlocks(displayData);
-  const text   = `USDC omnibus balance ${fmtMoney(displayData.omnibus_balance)} (updated ${toLondonTime(displayData.updated_at)})`;
-
-  // Edit the existing message if we have one; otherwise post a fresh one.
-  if (slackMessageTs) {
-    try {
-      await slackCall("chat.update", { channel: SLACK_CHANNEL, ts: slackMessageTs, text, blocks });
-      return;
-    } catch (e) {
-      // Server restarted / message deleted → fall through and post a new message.
-      if (!/message_not_found|cant_update_message/.test(e.message)) throw e;
-      slackMessageTs = null;
-    }
-  }
-
-  const res = await slackCall("chat.postMessage", { channel: SLACK_CHANNEL, text, blocks });
-  slackMessageTs = res.ts;
-  console.log("[slack] posted new message ts", slackMessageTs);
+  if (!r.ok) throw new Error(`flow responded HTTP ${r.status}`);
+  console.log("[flow] ✓ pushed to Excel dashboard");
 }
 
 // ─── GET /display  ← ESP32 polls this every hour ─────────────────────────────
@@ -267,4 +223,4 @@ if (require.main === module) {
   app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 }
 
-module.exports = { app, buildSlackBlocks, fmtMoney, toLondonTime, displayData };
+module.exports = { app, buildFlowPayload, toLondonTime, displayData };
